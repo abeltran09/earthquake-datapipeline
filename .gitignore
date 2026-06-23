@@ -1,0 +1,9 @@
+.venv
+.env
+keys/
+dbt/earthquakes/target/
+dbt/earthquakes/dbt_packages/
+dbt/earthquakes/logs/
+dbt/earthquakes/.user.yml
+__pycache__/
+*.pyc
