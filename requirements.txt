@@ -4,3 +4,4 @@ google-cloud-bigquery
 requests
 python-dotenv
 minio
+google-cloud-storage
