@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import requests
 from datetime import datetime, date
+import json
 import datetime as dt
 import time
 import argparse
@@ -9,6 +10,7 @@ import argparse
 API_BASE = "https://earthquake.usgs.gov/fdsnws/event/1"
 USER_AGENT = "usgs-earthquake-pipeline/1.0 (data-engineering)"
 MAX_PER_QUERY = 20000
+PATH_PREFIX = 'usgs-data'
 
 def _get_session() -> requests.Session:
     session = requests.Session()
@@ -23,7 +25,7 @@ def _fetch_count(session: requests.Session,start: date, end: date, min_mag: floa
     url = f"{API_BASE}/count"
     response = session.get(url, params=_base_params(start, end, min_mag), timeout=60)
     response.raise_for_status()
-    return response.json()
+    return response.json().get("count")
 
 def _fetch_data(session: requests.Session, start: date, end: date, min_mag: float):
     url = f"{API_BASE}/query"
@@ -38,6 +40,32 @@ def _fetch_data(session: requests.Session, start: date, end: date, min_mag: floa
     response.raise_for_status()
     raise RuntimeError("unreachable")
 
+
+def geojson_collection_to_ndjson(fc: dict, ingested_at: str, source_url: str, add_metadata: bool = True):
+    generated = fc.get('metadata', {}).get('generated', '')
+    lines = []
+    for feature in fc.get('features', []):
+        if add_metadata:
+            record = {
+                **feature,
+                "_ingested_at": ingested_at,
+                "source_url": source_url,
+                "_collection_generated": generated
+            }
+        else:
+            record = feature
+        lines.append(json.dumps(record, separators=(",",":"), ensure_ascii=False))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def collect_ndjson(session: requests.Session, start: date, end: date, min_mag: float, ingested_at: str):
+    count = _fetch_count(session, start, end, min_mag)
+    print(count)
+    if count > MAX_PER_QUERY:
+        pass
+    fc = _fetch_data(session, start, end, min_mag)
+    return geojson_collection_to_ndjson(fc, ingested_at, fc.get('metadata', {}).get('url', ''))
+
 def gcs_object_path(partition_date: date, run_ts: str, prefix: str = PATH_PREFIX) -> str:
     return (
         f"{prefix}/"
@@ -46,9 +74,25 @@ def gcs_object_path(partition_date: date, run_ts: str, prefix: str = PATH_PREFIX
     )
 
 
-
 def run(bucket, start, end, min_magnitude, partition_date, run_ts):
-    pass
+    session = _get_session()
+    ingested_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    ndjson_collection = collect_ndjson(session, start, end, min_magnitude, ingested_at)
+    return ndjson_collection
+    #object_path = gcs_object_path(partition_date, run_ts)
+
+def test_func(bucket):
+    from google.cloud import storage
+    try:
+        storage_client = storage.Client.from_service_account_json(
+            r"C:\Users\aabel\earthquake-datapipeline\keys\gcp-credentials.json"
+        )
+        resp = storage_client.get_bucket(bucket, timeout=60)
+        return resp
+    except NotFound:
+        print(f"Bucket {bucket} does not exist")
+        return None
+
 
 
 
@@ -66,7 +110,7 @@ def main():
     print(response.headers)
     '''
     parser = argparse.ArgumentParser(description="USGS earthquake -> GCS raw landing")
-    #parser.add_argument("--bucket", required=True, help='add bucket name in GCS')
+    parser.add_argument("--bucket", required=True, help='add bucket name in GCS')
     parser.add_argument("--start", required=True, type=_parse_dt)
     parser.add_argument("--end", required=True, type=_parse_dt)
     parser.add_argument("--min_magnitude", required=False, type=float, default=2.5)
@@ -77,8 +121,14 @@ def main():
     partition_date = args.partition_date or args.end
     run_ts = args.run_ts or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    test = run(args.bucket, args.start, args.end, args.min_magnitude, args.partition_date, args.run_ts)
+    #session = _get_session()
+    #print(_fetch_count(session, args.start, args.end, args.min_magnitude))
 
+    test = run(args.bucket, args.start, args.end, args.min_magnitude, args.partition_date, args.run_ts)
+    print(test)
+    #test_func(args.bucket)
+    #session = _get_session()
+    #print((session, args.start, args.end, args.min_magnitude))
 
 
     #print(partition_date)
