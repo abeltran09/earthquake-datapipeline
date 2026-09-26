@@ -57,13 +57,15 @@ python ingestion/usgs_to_gcs.py --bucket my-bucket --start 2026-09-19 --end 2026
 | Flag | Required | Description |
 |---|---|---|
 | `--bucket` | yes | destination GCS bucket |
-| `--start` | yes | window start date, `YYYY-MM-DD` |
-| `--end` | yes | window end date, `YYYY-MM-DD` (also the default partition date) |
+| `--start` | no | window start date, `YYYY-MM-DD` (filters on event occurrence time) |
+| `--end` | no | window end date, `YYYY-MM-DD` (filters on event occurrence time; also the default partition date) |
 | `--min_magnitude` | no | minimum event magnitude, default `2.5` |
-| `--partition_date` | no | overrides the partition date, for backfills where `--start`/`--end` span more than one day |
+| `--updated_after` | no | filters on when USGS last *revised* the record (`updatedafter`), not occurrence time — use this for a lookback that catches late magnitude/location revisions regardless of how old the original event is |
+| `--partition_date` | no | overrides the partition date; required if `--end` is omitted (e.g. an `--updated_after`-only run) |
 | `--overwrite` | no | re-upload even if an object already exists at the target path |
+| `--tag` | no | object filename tag, e.g. `revisions` → `usgs_earthquakes_revisions_YYYYMMDD.ndjson`; keeps a same-day `--updated_after` run from colliding with the plain new-events object |
 
-For daily ingestion, keep `--start`/`--end` to a single day so the query window and the partition date line up.
+For daily ingestion of new events, keep `--start`/`--end` to a single day so the query window and the partition date line up. For a trailing lookback that also catches revisions to older events, use `--updated_after` (optionally without `--start`/`--end` at all), pass `--partition_date` explicitly, and set `--tag revisions` so it lands as its own append-only file alongside — not overwriting — the original day's partition. Downstream, dedup on event `id` ordered by `properties.updated` to get each event's latest state.
 
 ## Idempotency
 
@@ -83,12 +85,25 @@ timestamp — so re-running the same day always targets the same object:
   rather than silently truncating — there's no automatic window-bisection yet. In practice this only matters for
   very wide date ranges or a very low `--min_magnitude`; single-day windows at the default magnitude are well
   under the cap.
-- **Late revisions**: because partitions are keyed by event-time window, a magnitude/location revision USGS
-  makes weeks after an event won't appear in that day's file unless the day is re-ingested with `--overwrite`.
-  Handling this automatically (e.g. a trailing re-ingest window) isn't built yet.
+- **Late revisions**: a magnitude/location revision USGS makes weeks after an event won't appear in the
+  original day's partition file. Use `--updated_after` on a separate, regularly scheduled run to catch these —
+  see [Usage](#usage). That run lands as a new append-only file (its own `--partition_date`), not an overwrite
+  of the original day, so downstream consumers must dedup by event `id` + `properties.updated`.
 
-## Airflow integration (planned)
+## Airflow integration
 
-`run(bucket, start, end, min_magnitude, partition_date=None, overwrite=False)` is the intended call point for a
-`PythonOperator`/`@task`, importable as `from ingestion.usgs_to_gcs import run`. `--start`/`--end` map naturally
-to a DAG's `data_interval_start`/`data_interval_end` for a daily schedule.
+Called as a CLI subprocess via `BashOperator`, not imported — see [airflow/dags/usgs_to_gcs_dag.py](../airflow/dags/usgs_to_gcs_dag.py)
+and [airflow/dags/usgs_reconciliation_dag.py](../airflow/dags/usgs_reconciliation_dag.py). Three tasks invoke
+this script across those two DAGs:
+
+- `ingest_new_events` (daily) — `--start`/`--end` map to `{{ macros.ds_add(ds, -1) }}`/`{{ ds }}`.
+- `ingest_revisions` (daily) — `--updated_after` is **not** a fixed lookback; it reads an Airflow Variable
+  (`usgs_revision_watermark`) that the DAG advances itself after each successful run, falling back to a
+  one-time 7-day bootstrap only if that Variable doesn't exist yet. `--tag revisions` keeps its object from
+  colliding with `ingest_new_events`'s.
+- `reconcile_revisions` (weekly, separate DAG) — a fixed 30-day `--updated_after` sweep, `--tag reconciliation`,
+  independent of the watermark above. A safety net for whatever the daily incremental cursor might miss.
+
+`run()` itself (this module's importable entry point) isn't actually used by Airflow — each task shells out to
+`python3 usgs_to_gcs.py ...` the same way you'd run it by hand, so CLI behavior and Airflow behavior can never
+drift apart.

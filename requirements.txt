@@ -3,5 +3,4 @@ dbt-bigquery==1.8.2
 google-cloud-bigquery
 requests
 python-dotenv
-minio
 google-cloud-storage
