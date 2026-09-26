@@ -31,27 +31,44 @@ def _get_session() -> requests.Session:
     return session
 
 
-def _base_params(starttime: date, endtime: date, mag: float | None):
-    return {
+def _base_params(starttime: date | None, endtime: date | None, mag: float | None, updated_after: date | None = None):
+    params = {
         "format": "geojson",
-        "starttime": starttime,
-        "endtime": endtime,
         "minmagnitude": mag,
         "orderby": "time-asc",
     }
+    if starttime is not None:
+        params["starttime"] = starttime
+    if endtime is not None:
+        params["endtime"] = endtime
+    if updated_after is not None:
+        params["updatedafter"] = updated_after
+    return params
 
 
-def _fetch_count(session: requests.Session, start: date, end: date, min_mag: float | None) -> int:
+def _fetch_count(
+    session: requests.Session,
+    start: date | None,
+    end: date | None,
+    min_mag: float | None,
+    updated_after: date | None = None,
+) -> int:
     url = f"{API_BASE}/count"
-    response = session.get(url, params=_base_params(start, end, min_mag), timeout=60)
+    response = session.get(url, params=_base_params(start, end, min_mag, updated_after), timeout=60)
     response.raise_for_status()
     return response.json().get("count", 0)
 
 
-def _fetch_data(session: requests.Session, start: date, end: date, min_mag: float | None):
+def _fetch_data(
+    session: requests.Session,
+    start: date | None,
+    end: date | None,
+    min_mag: float | None,
+    updated_after: date | None = None,
+):
     url = f"{API_BASE}/query"
     for attempt in range(3):
-        response = session.get(url, params=_base_params(start, end, min_mag), timeout=120)
+        response = session.get(url, params=_base_params(start, end, min_mag, updated_after), timeout=120)
         if response.status_code == 200:
             return response.json()
         if response.status_code in (429, 500, 502, 503, 504):
@@ -79,27 +96,38 @@ def geojson_collection_to_ndjson(fc: dict, ingested_at: str, source_url: str, ad
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def collect_ndjson(session: requests.Session, start: date, end: date, min_mag: float | None, ingested_at: str):
-    count = _fetch_count(session, start, end, min_mag)
-    log.info("USGS reports %s events for %s..%s (min_mag=%s)", count, start, end, min_mag)
+def collect_ndjson(
+    session: requests.Session,
+    start: date | None,
+    end: date | None,
+    min_mag: float | None,
+    ingested_at: str,
+    updated_after: date | None = None,
+):
+    count = _fetch_count(session, start, end, min_mag, updated_after)
+    log.info(
+        "USGS reports %s events for %s..%s (min_mag=%s, updated_after=%s)",
+        count, start, end, min_mag, updated_after,
+    )
     if count > MAX_PER_QUERY:
         raise RuntimeError(
             f"{count} results exceed the USGS per-query cap of {MAX_PER_QUERY}; narrow the window"
         )
-    fc = _fetch_data(session, start, end, min_mag)
+    fc = _fetch_data(session, start, end, min_mag, updated_after)
     return geojson_collection_to_ndjson(fc, ingested_at, fc.get("metadata", {}).get("url", ""))
 
 
-def compute_partition_date(end: date, override: date | None = None) -> date:
+def compute_partition_date(end: date | None, override: date | None = None) -> date:
     """Partition is derived from the query window unless explicitly overridden (backfills)."""
     return override or end
 
 
-def gcs_object_path(partition_date: date, prefix: str = PATH_PREFIX) -> str:
+def gcs_object_path(partition_date: date, prefix: str = PATH_PREFIX, tag: str | None = None) -> str:
+    tag_part = f"{tag}_" if tag else ""
     return (
         f"{prefix}/"
         f"year={partition_date:%Y}/month={partition_date:%m}/day={partition_date:%d}/"
-        f"usgs_earthquakes_{partition_date:%Y%m%d}.ndjson"
+        f"usgs_earthquakes_{tag_part}{partition_date:%Y%m%d}.ndjson"
     )
 
 
@@ -129,12 +157,14 @@ def upload_to_gcs(bucket_name: str, object_path: str, data: str, overwrite: bool
     return target
 
 
-def run(bucket, start, end, min_magnitude, partition_date=None, overwrite=False):
+def run(bucket, start, end, min_magnitude, partition_date=None, overwrite=False, updated_after=None, tag=None):
+    if end is None and partition_date is None:
+        raise ValueError("--partition_date is required when --end is not given")
     session = _get_session()
     ingested_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    ndjson_collection = collect_ndjson(session, start, end, min_magnitude, ingested_at)
+    ndjson_collection = collect_ndjson(session, start, end, min_magnitude, ingested_at, updated_after)
     resolved_partition_date = compute_partition_date(end, partition_date)
-    object_path = gcs_object_path(resolved_partition_date)
+    object_path = gcs_object_path(resolved_partition_date, tag=tag)
     return upload_to_gcs(bucket, object_path, ndjson_collection, overwrite=overwrite)
 
 
@@ -147,19 +177,38 @@ def main():
 
     parser = argparse.ArgumentParser(description="USGS earthquake -> GCS raw landing")
     parser.add_argument("--bucket", required=True, help="destination GCS bucket name")
-    parser.add_argument("--start", required=True, type=_parse_dt)
-    parser.add_argument("--end", required=True, type=_parse_dt)
+    parser.add_argument("--start", required=False, type=_parse_dt, default=None)
+    parser.add_argument("--end", required=False, type=_parse_dt, default=None)
     parser.add_argument("--min_magnitude", required=False, type=float, default=2.5)
+    parser.add_argument(
+        "--updated_after",
+        type=_parse_dt,
+        default=None,
+        help=(
+            "lookback for revisions: include events whose USGS record was updated on/after this "
+            "date, regardless of when the event occurred. Combine with --partition_date since "
+            "--end may be omitted."
+        ),
+    )
     parser.add_argument(
         "--partition_date",
         type=_parse_dt,
         default=None,
-        help="override the partition date (for backfills); defaults to --end",
+        help="override the partition date (for backfills, or when --end is omitted); defaults to --end",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="re-upload even if the target object already exists",
+    )
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help=(
+            "object filename tag, e.g. 'revisions' -> usgs_earthquakes_revisions_YYYYMMDD.ndjson. "
+            "Use this to keep an --updated_after run's output from colliding with the same day's "
+            "plain new-events object."
+        ),
     )
     args = parser.parse_args()
 
@@ -170,6 +219,8 @@ def main():
         args.min_magnitude,
         partition_date=args.partition_date,
         overwrite=args.overwrite,
+        updated_after=args.updated_after,
+        tag=args.tag,
     )
     log.info("done: %s", target)
 
